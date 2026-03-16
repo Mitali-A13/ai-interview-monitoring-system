@@ -1,19 +1,8 @@
-/* ═══════════════════════════════════════════════════════════════
-   AI Interview Monitoring System — script.js
-   Covers: webcam, countdown timer, violation log API,
-           problem loader, run-button sandbox, UI helpers.
 
-   Other modules (ai/faceDetection.js, ai/eyeTracking.js,
-   ai/lipMovement.js, monitoring/*.js) call the public API
-   exposed on window at the bottom of this file.
-   ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
 
-   /* ══════════════════════════════════════════════════════════════
-      1.  PROBLEM BANK + LOADER
-      ══════════════════════════════════════════════════════════════ */
-   
+  
    const problems = [
      {
        title:       "Two Sum",
@@ -47,10 +36,7 @@
      },
    ];
    
-   /**
-    * Picks a random problem and populates the center panel.
-    * Exposed as window.loadProblem() so external code can call it.
-    */
+   
    function loadProblem() {
      const problem = problems[Math.floor(Math.random() * problems.length)];
      const idx     = problems.indexOf(problem) + 1;
@@ -71,20 +57,14 @@
    }
    
    
-   /* ══════════════════════════════════════════════════════════════
-      2.  WEBCAM
-      ══════════════════════════════════════════════════════════════ */
+   
    
    const VIDEO_CONSTRAINTS = {
      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
      audio: false,
    };
    
-   /**
-    * Requests webcam access and streams it into #video.
-    * On success → updateCameraUI(true).
-    * On failure → alert + updateCameraUI(false).
-    */
+   
    async function startCamera() {
      console.log("[Camera] Requesting webcam access…");
    
@@ -209,9 +189,7 @@
    }
    
    
-   /* ══════════════════════════════════════════════════════════════
-      3.  COUNTDOWN TIMER  (60 minutes, MM:SS)
-      ══════════════════════════════════════════════════════════════ */
+   
    
    const INTERVIEW_DURATION = 60 * 60; // seconds
    
@@ -260,33 +238,14 @@
    })();
    
    
-   /* ══════════════════════════════════════════════════════════════
-      4.  VIOLATION LOG API  — delegates to core/violationManager.js
-      ══════════════════════════════════════════════════════════════
    
-      ViolationManager is loaded first (see index.html) and owns all
-      violation state.  This section re-exports its API so the rest of
-      this file can reference SEVERITY / addViolation without changes,
-      and so any inline demo calls still work.
-      ══════════════════════════════════════════════════════════════ */
-   
-   /**
-    * SEVERITY — re-exported from ViolationManager for local use.
-    * External modules should reference window.SEVERITY or
-    * ViolationManager.SEVERITY directly.
-    */
    const SEVERITY = window.SEVERITY || {
      LOW:    { key: "low",    label: "WARN"   },
      MEDIUM: { key: "medium", label: "MEDIUM" },
      HIGH:   { key: "high",   label: "HIGH"   },
    };
    
-   /**
-    * addViolation — thin wrapper kept for backward compatibility.
-    * Delegates to ViolationManager.registerViolation().
-    *
-    * Prefer calling window.registerViolation() from monitoring modules.
-    */
+   
    function addViolation(message, severity = SEVERITY.LOW) {
      if (window.ViolationManager) {
        // Resolve legacy {key,label} objects to string keys
@@ -297,17 +256,13 @@
      console.warn("[script.js] ViolationManager not available:", message);
    }
    
-   /** updateWarningLevel — ViolationManager handles this internally now. */
+   
    function updateWarningLevel() {
-     /* no-op: ViolationManager._updateWarningLevel() is called inside
-        registerViolation(). This stub prevents ReferenceErrors if any
-        legacy code calls updateWarningLevel() directly. */
+     
    }
    
    
-   /* ══════════════════════════════════════════════════════════════
-      5.  CODE EDITOR — RUN BUTTON (sandboxed eval)
-      ══════════════════════════════════════════════════════════════ */
+
    
    function initEditor() {
      const runBtn    = document.getElementById("btnRun");
@@ -359,9 +314,7 @@
    }
    
    
-   /* ══════════════════════════════════════════════════════════════
-      6.  UTILITIES
-      ══════════════════════════════════════════════════════════════ */
+   
    
    function pad(n) { return String(n).padStart(2, "0"); }
    function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
@@ -370,22 +323,13 @@
    }
    
    
-   /* ══════════════════════════════════════════════════════════════
-      7.  PUBLIC API  (consumed by ai/ and monitoring/ modules)
-      ══════════════════════════════════════════════════════════════ */
    
    window.addViolation   = addViolation;
    window.SEVERITY       = SEVERITY;
    window.setModuleState = setModuleState;
    window.updateCameraUI = updateCameraUI;
    window.loadProblem    = loadProblem;
-   // AI modules are self-registering: FaceDetection, EyeTracking, LipMovement
-   // are placed on window by their own files and called via startFaceDetection().
    
-   
-   /* ══════════════════════════════════════════════════════════════
-      8.  INIT
-      ══════════════════════════════════════════════════════════════ */
    
    document.addEventListener("DOMContentLoaded", () => {
      console.log("[Init] DOM ready — AI Interview Monitoring System starting.");

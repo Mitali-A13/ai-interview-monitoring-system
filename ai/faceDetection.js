@@ -1,36 +1,4 @@
-/* ═══════════════════════════════════════════════════════════════
-   AI Interview Monitoring System
-   ai/faceDetection.js — MediaPipe FaceMesh Pipeline
 
-   Responsibilities
-   ────────────────
-   1. Load MediaPipe FaceMesh from CDN and configure it.
-   2. Open a requestAnimationFrame loop that feeds each video frame
-      to FaceMesh for landmark extraction.
-   3. On each result:
-        • Update "Faces Detected" counter in the UI.
-        • Trigger violations for 0 faces (absent) or 2+ faces (cheating).
-        • Forward landmarks to eyeTracking.js and lipMovement.js.
-   4. Expose startFaceDetection() for script.js to call after the
-      webcam stream is live.
-
-   MediaPipe CDN
-   ─────────────
-   The FaceMesh solution and its dependencies are loaded via the
-   official CDN at https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh.
-   They must be present in <script> tags BEFORE this file executes —
-   see index.html for the exact load order.
-
-   Landmark indices (subset used here)
-   ─────────────────────────────────────
-   Full map: https://github.com/google/mediapipe/blob/master/mediapipe/modules/face_geometry/data/canonical_face_model_uv_visualization.png
-   • Left eye:   [33, 133, 160, 144, 158, 153]
-   • Right eye:  [362, 263, 385, 380, 387, 373]
-   • Iris (left):  [468, 469, 470, 471, 472]   (refineLandmarks: true)
-   • Iris (right): [473, 474, 475, 476, 477]
-   • Lips inner:   [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308]
-   • Lips outer:   [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308]
-   ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
 
@@ -72,9 +40,7 @@
       */
      const ABSENT_COOLDOWN_MS = 8_000;
    
-     /* ══════════════════════════════════════════════════════════════
-        STATE
-        ══════════════════════════════════════════════════════════════ */
+     
    
      /** MediaPipe FaceMesh instance. */
      let _faceMesh = null;
@@ -124,11 +90,7 @@
        }
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        PRIVATE — RESULT HANDLER
-        Called by FaceMesh on every processed frame.
-        ══════════════════════════════════════════════════════════════ */
-   
+     
      function _onResults(results) {
        _stats.framesProcessed++;
        _lastResult = results;
@@ -213,15 +175,7 @@
        }
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        PRIVATE — ANIMATION FRAME LOOP
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Sends one video frame to FaceMesh and schedules the next iteration.
-      * Uses requestAnimationFrame so processing is tied to display refresh
-      * (typically 30–60 fps) rather than a fixed interval.
-      */
+     
      async function _loop() {
        if (!_running) return;
    
@@ -239,18 +193,7 @@
        _rafId = requestAnimationFrame(_loop);
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        PUBLIC API
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Initialises FaceMesh and starts the frame-analysis loop.
-      * Must be called AFTER the webcam stream is live (i.e. inside the
-      * startCamera() success branch or a DOMContentLoaded callback that
-      * waits for the video to be playing).
-      *
-      * @returns {Promise<void>}
-      */
+     
      async function start() {
        if (_running) {
          console.warn("[FaceDetection] Already running — start() ignored.");
@@ -315,11 +258,7 @@
        console.log("[FaceDetection] Pipeline stopped.");
      }
    
-     /**
-      * Returns the most recent FaceMesh result object.
-      * Useful for debugging and unit tests.
-      * @returns {object|null}
-      */
+     
      function getLastResult() {
        return _lastResult;
      }
@@ -344,11 +283,7 @@
    /* ── Global alias ────────────────────────────────────────────── */
    window.FaceDetection = FaceDetection;
    
-   /**
-    * startFaceDetection()
-    * ─────────────────────
-    * Named export called from script.js after startCamera() succeeds.
-    */
+   
    async function startFaceDetection() {
      await FaceDetection.start();
      return FaceDetection;

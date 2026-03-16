@@ -1,69 +1,9 @@
-/* ═══════════════════════════════════════════════════════════════
-   AI Interview Monitoring System
-   ai/eyeTracking.js — Gaze Direction & Look-Away Detector
-
-   ┌─────────────────────────────────────────────────────────────┐
-   │  HOW IT WORKS                                               │
-   │                                                             │
-   │  MediaPipe FaceMesh (refineLandmarks: true) provides 478    │
-   │  normalised landmarks per face.  This module computes the   │
-   │  horizontal and vertical iris position relative to the eye  │
-   │  socket corners, producing a gaze ratio in [0, 1] for each  │
-   │  axis.  Both eyes are measured and averaged to cancel out   │
-   │  asymmetry caused by natural head tilt.                     │
-   │                                                             │
-   │  GAZE RATIO (horizontal)                                    │
-   │  ──────────────────────                                     │
-   │  ratio = (iris.x - outerCorner.x)                          │
-   │          ────────────────────────                           │
-   │          (innerCorner.x - outerCorner.x)                   │
-   │                                                             │
-   │  0.0 ─── looking hard left                                  │
-   │  0.5 ─── looking straight at screen  (normal)              │
-   │  1.0 ─── looking hard right                                 │
-   │                                                             │
-   │  SMOOTHING                                                  │
-   │  ─────────                                                  │
-   │  A rolling window of the last SMOOTH_WINDOW raw direction   │
-   │  results is kept.  A direction is declared only when it     │
-   │  appears in > 60 % of the window, preventing single-frame   │
-   │  spikes from counting as "away".                            │
-   │                                                             │
-   │  VIOLATION LOGIC                                            │
-   │  ───────────────                                            │
-   │  A wall-clock timer tracks how long the smoothed gaze has   │
-   │  been "away".  Only after 5 continuous seconds away does    │
-   │  registerViolation("Looking away from screen") fire.        │
-   │  Glances shorter than 1 s are completely ignored.           │
-   └─────────────────────────────────────────────────────────────┘
-
-   Landmark indices used  (per MediaPipe FaceMesh canonical map)
-   ─────────────────────────────────────────────────────────────
-   Left eye  : outer 33, inner 133, top 160, bottom 144,
-               also: 158, 153 (EAR calculation)
-   Right eye : outer 263, inner 362, top 387, bottom 380,
-               also: 385, 373 (EAR calculation)
-   Left iris : 468  (centre — requires refineLandmarks: true)
-   Right iris: 473  (centre)
-
-   Integration
-   ─────────────────────────────────────────────────────────────
-   Called per-frame by ai/faceDetection.js:
-     EyeTracking.processFrame(landmarks);
-
-   Also callable directly (spec-required named export):
-     processEyeTracking(landmarks);
-   ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
 
    const EyeTracking = (function () {
    
-     /* ══════════════════════════════════════════════════════════════
-        1.  CONFIGURATION
-        ══════════════════════════════════════════════════════════════ */
-   
-     // ── Landmark indices (spec + EAR supplements) ─────────────────
+     
      const LM = {
        // Left eye — spec indices: 33, 160, 158, 133, 153, 144
        L_OUTER:  33,   // left-most corner
@@ -124,9 +64,7 @@
       */
      const VIOLATION_COOLDOWN_MS = 8_000;
    
-     /* ══════════════════════════════════════════════════════════════
-        2.  STATE
-        ══════════════════════════════════════════════════════════════ */
+     
    
      /** Rolling buffer of the last SMOOTH_WINDOW raw direction strings. */
      const _dirBuffer = [];
@@ -158,9 +96,7 @@
        directionCounts:    { Center: 0, Left: 0, Right: 0, Up: 0, Down: 0 },
      };
    
-     /* ══════════════════════════════════════════════════════════════
-        3.  PRIVATE UTILITIES
-        ══════════════════════════════════════════════════════════════ */
+     
    
      function _el(id) { return document.getElementById(id); }
      function _setText(id, val) { const e = _el(id); if (e) e.textContent = val; }
@@ -192,16 +128,7 @@
        return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        4.  EYE ASPECT RATIO  (blink / closed-eye guard)
-        ══════════════════════════════════════════════════════════════
-   
-        EAR = (|p1-p5| + |p2-p4|) / (2 × |p0-p3|)
-   
-        where p0/p3 are the horizontal corners and p1/p2/p4/p5 are
-        the vertical lid points.  EAR < EAR_THRESHOLD → eye is closed.
-        We skip gaze analysis on closed eyes to avoid erratic ratios.
-        ══════════════════════════════════════════════════════════════ */
+     
    
      function _ear(lm, outerIdx, innerIdx, topAIdx, topBIdx, botAIdx, botBIdx) {
        const outer = _pt(lm, outerIdx);
@@ -222,18 +149,7 @@
        return (vertA + vertB) / (2 * horizontal);
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        5.  GAZE RATIO COMPUTATION
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Horizontal iris ratio for one eye.
-      * 0 = iris at outer corner (looking away from nose)
-      * 1 = iris at inner corner (looking toward nose)
-      *
-      * We normalise so 0.5 always means "centre" regardless of which
-      * eye we're measuring.
-      */
+     
      function _hRatio(lm, outerIdx, innerIdx, irisIdx) {
        const outer = _pt(lm, outerIdx);
        const inner = _pt(lm, innerIdx);
@@ -267,19 +183,7 @@
        return (iris.y - Math.min(top.y, bot.y)) / height;
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        6.  DIRECTION CLASSIFICATION
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Classifies the current frame's raw gaze into one of:
-      * "Center" | "Left" | "Right" | "Up" | "Down"
-      *
-      * Returns null when both eyes are closed (blink guard).
-      *
-      * @param {Array} lm  MediaPipe landmark array.
-      * @returns {string|null}
-      */
+     
      function _classifyRaw(lm) {
        // ── Blink / closed-eye guard ──────────────────────────────────
        const earL = _ear(lm, LM.L_OUTER, LM.L_INNER, LM.L_TOP_A, LM.L_TOP_B, LM.L_BOT_A, LM.L_BOT_B);
@@ -306,18 +210,7 @@
        else                                  return "Center";
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        7.  SMOOTHING  (rolling majority vote)
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Pushes a new raw direction into the rolling buffer and returns
-      * the majority-vote smoothed direction.  Null frames (blinks) are
-      * not pushed so they don't dilute the window.
-      *
-      * @param {string|null} rawDir
-      * @returns {string}  The smoothed direction.
-      */
+     
      function _smooth(rawDir) {
        if (rawDir !== null) {
          _dirBuffer.push(rawDir);
@@ -340,16 +233,7 @@
        return (bestCount / _dirBuffer.length) >= SMOOTH_MAJORITY ? best : "Center";
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        8.  TIME-BASED AWAY TRACKING & VIOLATION
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * Called on every frame with the smoothed direction.
-      * Manages wall-clock timers and fires violations when appropriate.
-      *
-      * @param {string} direction  Smoothed gaze direction.
-      */
+     
      function _updateAwayTimer(direction) {
        const isAway = direction !== "Center";
        const nowMs  = Date.now();
@@ -404,18 +288,7 @@
        }
      }
    
-     /* ══════════════════════════════════════════════════════════════
-        9.  PUBLIC API
-        ══════════════════════════════════════════════════════════════ */
-   
-     /**
-      * processFrame(landmarks)
-      * ────────────────────────
-      * Main entry point called by faceDetection.js on every frame.
-      *
-      * @param {Array|null} landmarks  MediaPipe 478-point landmark array,
-      *                                or null when no face is detected.
-      */
+     
      function processFrame(landmarks) {
        _stats.framesAnalysed++;
    
@@ -453,10 +326,7 @@
        _isCurrentlyAway = (_smoothedDirection !== "Center" && _smoothedDirection !== "—");
      }
    
-     /**
-      * getStats()
-      * Returns a snapshot of session data — useful for review or testing.
-      */
+     
      function getStats() {
        return {
          smoothedDirection: _smoothedDirection,
@@ -477,18 +347,7 @@
    })(); // end EyeTracking IIFE
    
    
-   /* ══════════════════════════════════════════════════════════════
-      NAMED EXPORT  (spec requirement)
-      ══════════════════════════════════════════════════════════════ */
    
-   /**
-    * processEyeTracking(landmarks)
-    * ──────────────────────────────
-    * Spec-required named function export.
-    * Delegates to EyeTracking.processFrame().
-    *
-    * @param {Array|null} landmarks
-    */
    function processEyeTracking(landmarks) {
      EyeTracking.processFrame(landmarks);
    }
