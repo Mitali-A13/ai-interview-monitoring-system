@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AI Interview Monitoring System</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <!-- ══════════════════════════════ HEADER ══════════════════════════════ -->
+  <header class="header">
+    <div class="header-brand">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      </svg>
+      <span>AI Interview Monitoring System</span>
+    </div>
+
+    <div class="header-timer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+      </svg>
+      <span class="timer-label">Time Remaining:</span>
+      <span id="interviewTimer" class="timer-display">60:00</span>
+    </div>
+
+    <div class="header-status">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="systemStatus">Monitoring Active</span>
+    </div>
+  </header>
+
+  <!-- ══════════════════════════════ DASHBOARD ══════════════════════════════ -->
+  <main class="dashboard">
+
+    <!-- ─────────────────── LEFT PANEL — Candidate Monitoring ─────────────────── -->
+    <aside class="panel">
+      <div class="panel-heading">
+        <span class="panel-title">Candidate Monitoring</span>
+        <span class="badge badge-live">● LIVE</span>
+      </div>
+
+      <!-- Webcam feed -->
+      <div class="webcam-wrapper">
+        <video id="video" autoplay muted playsinline></video>
+
+        <!-- Targeting corners -->
+        <span class="corner tl"></span>
+        <span class="corner tr"></span>
+        <span class="corner bl"></span>
+        <span class="corner br"></span>
+
+        <!-- REC badge -->
+        <div class="rec-badge" id="recBadge">
+          <span class="rec-dot"></span>REC
+        </div>
+
+        <!-- No-signal fallback -->
+        <div class="cam-offline" id="camNoSignal">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
+            <line x1="1" y1="1" x2="23" y2="23"/>
+          </svg>
+          <span>Camera Initializing…</span>
+        </div>
+      </div>
+
+      <!-- Detection readout — required IDs -->
+      <div class="detection-panel">
+        <div class="detection-heading">Detection Status</div>
+
+        <div class="det-row">
+          <span class="det-label">Faces Detected:</span>
+          <span class="det-val" id="faceCount">0</span>
+        </div>
+
+        <div class="det-row">
+          <span class="det-label">Eye Status:</span>
+          <span class="det-val" id="eyeStatus">Initializing</span>
+        </div>
+
+        <div class="det-row">
+          <span class="det-label">Mouth Movement:</span>
+          <span class="det-val" id="mouthStatus">Initializing</span>
+        </div>
+      </div>
+
+      <!-- Module status indicators -->
+      <div class="module-list">
+        <div class="module-row">
+          <span class="mod-dot" id="faceDot"></span>
+          <span class="mod-name">Face Detection</span>
+          <span class="mod-state" id="faceDetectionStatus">Initializing</span>
+        </div>
+        <div class="module-row">
+          <span class="mod-dot" id="eyeDot"></span>
+          <span class="mod-name">Eye Tracking</span>
+          <span class="mod-state" id="eyeTrackingStatus">Initializing</span>
+        </div>
+        <div class="module-row">
+          <span class="mod-dot" id="mouthDot"></span>
+          <span class="mod-name">Lip Movement</span>
+          <span class="mod-state" id="mouthAnalysisStatus">Initializing</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ─────────────────── CENTER PANEL — Interview Area ─────────────────── -->
+    <section class="panel">
+      <div class="panel-heading">
+        <span class="panel-title">Interview Area</span>
+        <span class="badge" id="problemBadge">Problem 1 / 3</span>
+      </div>
+
+      <!-- Problem statement (populated by JS) -->
+      <div class="problem-card">
+        <h2 class="problem-title" id="problemTitle">Loading…</h2>
+        <p  class="problem-desc"  id="problemDesc"></p>
+        <div class="problem-example">
+          <span class="example-label">Example Input</span>
+          <code id="problemInput"></code>
+        </div>
+      </div>
+
+      <!-- Code editor -->
+      <div class="editor-card">
+        <div class="editor-bar">
+          <span class="editor-filename">solution.js</span>
+          <div class="editor-actions">
+            <button class="btn btn-run"    id="btnRun">▶ Run</button>
+            <button class="btn btn-submit" id="btnSubmit">Submit</button>
+          </div>
+        </div>
+        <textarea
+          id="codeEditor"
+          class="code-editor"
+          spellcheck="false"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          placeholder="// Write your solution here…"
+        ></textarea>
+      </div>
+
+      <!-- Output console -->
+      <div class="output-card">
+        <div class="output-bar">
+          <span>Output</span>
+          <button class="output-clear" id="outputClear">Clear</button>
+        </div>
+        <div class="output-body" id="outputBody">
+          <span class="output-placeholder">Run your code to see output.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────── RIGHT PANEL — Monitoring Panel ─────────────────── -->
+    <aside class="panel">
+      <div class="panel-heading">
+        <span class="panel-title">Monitoring Panel</span>
+        <span class="badge badge-clear" id="alertBadge">CLEAR</span>
+      </div>
+
+      <!-- Total violation counter -->
+      <div class="stat-card">
+        <div class="stat-number" id="violations">0</div>
+        <div class="stat-label">Total Violations</div>
+      </div>
+
+      <!-- Warning level bar -->
+      <div class="warn-card" id="warnCard">
+        <div class="warn-row">
+          <span class="warn-title">Warning Level</span>
+          <span class="warn-value" id="warningLevel">LOW</span>
+        </div>
+        <div class="warn-track">
+          <div class="warn-fill" id="warningBarFill" style="width: 8%"></div>
+        </div>
+        <div class="warn-scale">
+          <span>LOW</span><span>MED</span><span>HIGH</span><span>CRIT</span>
+        </div>
+      </div>
+
+      <!-- Violation log console -->
+      <div class="vlog-card">
+        <div class="vlog-header">
+          <span class="vlog-title">Violation Log</span>
+          <div class="vlog-header-right">
+            <span class="badge-live-small"><span class="rec-dot small"></span>LIVE</span>
+            <span class="vlog-count" id="vlogCount">0 events</span>
+          </div>
+        </div>
+
+        <div class="vlog-prompt">
+          <span class="prompt-user">proctor@monitor</span><span class="prompt-sep">:</span><span class="prompt-cmd">~$ tail -f violations.log</span><span class="prompt-cursor">▋</span>
+        </div>
+
+        <ul class="vlog-list" id="violationLog">
+          <li class="vlog-empty">No violations recorded.</li>
+        </ul>
+
+        <div class="vlog-footer">
+          <span class="vlog-status-dot"></span>
+          <span id="vlogLastEvt">Last event: —</span>
+        </div>
+      </div>
+
+    </aside>
+  </main>
+
+  <!-- ══════════════════════════════ STATUS BAR ══════════════════════════════ -->
+  <footer class="statusbar">
+    <span class="sb-item">
+      <span class="status-dot small"></span>
+      Proctoring Active
+    </span>
+    <span class="sb-sep"></span>
+    <span class="sb-item">Session: Technical Interview Round</span>
+    <span class="sb-sep"></span>
+    <span class="sb-item" id="sbCamera">Camera: Offline</span>
+  </footer>
+
+  <!-- MediaPipe FaceMesh — must load before ai/faceDetection.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+  <!-- AI detection modules (load order matters) -->
+  <script src="ai/lipMovement.js"></script>
+  <script src="ai/eyeTracking.js"></script>
+  <script src="ai/faceDetection.js"></script>
+
+  <script src="core/violationManager.js"></script>
+  <script src="monitoring/tabMonitor.js"></script>
+  <script src="monitoring/clipboardMonitor.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
