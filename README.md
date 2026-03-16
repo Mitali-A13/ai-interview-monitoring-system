@@ -133,6 +133,16 @@ Example:
 
 ---
 
+# Screenshots
+
+## Monitoring Dashboard
+![Monitoring Dashboard](screenshots/dashboard.jpeg)
+
+## Violation Detection
+![Violation Detection](screenshots/violation-log.jpeg)
+
+---
+
 # System Architecture
 
 ```
