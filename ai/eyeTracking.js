@@ -2,39 +2,57 @@
    AI Interview Monitoring System
    ai/eyeTracking.js — Gaze Direction & Look-Away Detector
 
-   How it works
-   ────────────
-   MediaPipe FaceMesh with refineLandmarks:true exposes 10 iris
-   landmarks (5 per eye, indices 468–477).  The iris centre relative
-   to the eye corner bounding box tells us where the candidate is
-   looking.
+   ┌─────────────────────────────────────────────────────────────┐
+   │  HOW IT WORKS                                               │
+   │                                                             │
+   │  MediaPipe FaceMesh (refineLandmarks: true) provides 478    │
+   │  normalised landmarks per face.  This module computes the   │
+   │  horizontal and vertical iris position relative to the eye  │
+   │  socket corners, producing a gaze ratio in [0, 1] for each  │
+   │  axis.  Both eyes are measured and averaged to cancel out   │
+   │  asymmetry caused by natural head tilt.                     │
+   │                                                             │
+   │  GAZE RATIO (horizontal)                                    │
+   │  ──────────────────────                                     │
+   │  ratio = (iris.x - outerCorner.x)                          │
+   │          ────────────────────────                           │
+   │          (innerCorner.x - outerCorner.x)                   │
+   │                                                             │
+   │  0.0 ─── looking hard left                                  │
+   │  0.5 ─── looking straight at screen  (normal)              │
+   │  1.0 ─── looking hard right                                 │
+   │                                                             │
+   │  SMOOTHING                                                  │
+   │  ─────────                                                  │
+   │  A rolling window of the last SMOOTH_WINDOW raw direction   │
+   │  results is kept.  A direction is declared only when it     │
+   │  appears in > 60 % of the window, preventing single-frame   │
+   │  spikes from counting as "away".                            │
+   │                                                             │
+   │  VIOLATION LOGIC                                            │
+   │  ───────────────                                            │
+   │  A wall-clock timer tracks how long the smoothed gaze has   │
+   │  been "away".  Only after 5 continuous seconds away does    │
+   │  registerViolation("Looking away from screen") fire.        │
+   │  Glances shorter than 1 s are completely ignored.           │
+   └─────────────────────────────────────────────────────────────┘
 
-   Landmark groups used
-   ─────────────────────
-   Left eye corners  : 33 (left-most) and 133 (right-most)
-   Left iris centre  : 468
-   Right eye corners : 362 (right-most) and 263 (left-most)
-   Right iris centre : 473
-
-   Gaze ratio
-   ──────────
-   ratio = (irisX - leftCornerX) / (rightCornerX - leftCornerX)
-
-   ratio ≈ 0.5  → looking straight ahead (normal)
-   ratio < 0.35 → looking left
-   ratio > 0.65 → looking right
-
-   Vertical gaze is also checked:
-   left eye top: 159, bottom: 145 → vertical ratio using iris Y.
-
-   A violation fires only after the candidate has been looking away
-   for AWAY_FRAME_THRESHOLD consecutive frames, preventing
-   momentary glances from being flagged.
+   Landmark indices used  (per MediaPipe FaceMesh canonical map)
+   ─────────────────────────────────────────────────────────────
+   Left eye  : outer 33, inner 133, top 160, bottom 144,
+               also: 158, 153 (EAR calculation)
+   Right eye : outer 263, inner 362, top 387, bottom 380,
+               also: 385, 373 (EAR calculation)
+   Left iris : 468  (centre — requires refineLandmarks: true)
+   Right iris: 473  (centre)
 
    Integration
-   ───────────
-   EyeTracking.processFrame(landmarks) is called by faceDetection.js
-   on every analysed frame.  Null landmarks mean no face was detected.
+   ─────────────────────────────────────────────────────────────
+   Called per-frame by ai/faceDetection.js:
+     EyeTracking.processFrame(landmarks);
+
+   Also callable directly (spec-required named export):
+     processEyeTracking(landmarks);
    ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
@@ -42,80 +60,110 @@
    const EyeTracking = (function () {
    
      /* ══════════════════════════════════════════════════════════════
-        CONFIGURATION
+        1.  CONFIGURATION
         ══════════════════════════════════════════════════════════════ */
    
-     /**
-      * Gaze ratio thresholds.
-      * Values outside [LEFT_LIMIT, RIGHT_LIMIT] are "looking away".
-      * Values outside [TOP_LIMIT, BOTTOM_LIMIT] are "looking up/down".
-      */
-     const GAZE = {
-       LEFT_LIMIT:   0.35,
-       RIGHT_LIMIT:  0.65,
-       TOP_LIMIT:    0.35,
-       BOTTOM_LIMIT: 0.70,
+     // ── Landmark indices (spec + EAR supplements) ─────────────────
+     const LM = {
+       // Left eye — spec indices: 33, 160, 158, 133, 153, 144
+       L_OUTER:  33,   // left-most corner
+       L_INNER:  133,  // right-most (inner canthus)
+       L_TOP_A:  160,
+       L_TOP_B:  158,
+       L_BOT_A:  144,
+       L_BOT_B:  153,
+       L_IRIS:   468,  // refined landmark — iris centre
+   
+       // Right eye — spec indices: 263, 387, 385, 362, 380, 373
+       R_OUTER:  263,  // right-most corner
+       R_INNER:  362,  // left-most (inner canthus)
+       R_TOP_A:  387,
+       R_TOP_B:  385,
+       R_BOT_A:  373,
+       R_BOT_B:  380,
+       R_IRIS:   473,  // refined landmark — iris centre
      };
    
-     /**
-      * How many consecutive frames the gaze must be "away" before a
-      * violation fires.  At ~30 fps this is roughly 1.5 seconds —
-      * enough time to distinguish a genuine glance from a momentary
-      * eye movement.
-      */
-     const AWAY_FRAME_THRESHOLD = 45;
+     // ── Gaze classification thresholds ────────────────────────────
+     const GAZE_THRESHOLD = {
+       H_LEFT:   0.38,   // horizontal ratio below this → looking left
+       H_RIGHT:  0.62,   // horizontal ratio above this → looking right
+       V_UP:     0.38,   // vertical ratio below this   → looking up
+       V_DOWN:   0.68,   // vertical ratio above this   → looking down
+     };
+   
+     // ── Eye Aspect Ratio — blink / eye-closed detection ───────────
+     const EAR_THRESHOLD = 0.18;  // below this → eye closed (ignore frame)
+   
+     // ── Smoothing ─────────────────────────────────────────────────
+     /** Rolling window size for direction smoothing (frames). */
+     const SMOOTH_WINDOW = 10;
    
      /**
-      * Minimum milliseconds between two "looking away" violations.
+      * Fraction of window that must agree on a direction before it is
+      * declared.  0.6 = 60 % majority.
+      */
+     const SMOOTH_MAJORITY = 0.6;
+   
+     // ── Violation timing ──────────────────────────────────────────
+     /**
+      * Continuous seconds looking away before a violation fires.
+      * Spec requirement: 5 seconds.
+      */
+     const AWAY_VIOLATION_SECS = 5;
+   
+     /**
+      * Glances shorter than this many seconds are silently ignored.
+      * Spec requirement: < 1 second.
+      */
+     const IGNORE_BELOW_SECS = 1;
+   
+     /**
+      * Minimum ms between two accepted "Looking away" violations.
       * Longer than ViolationManager.DEBOUNCE_MS (3 000 ms).
       */
-     const LOOK_AWAY_COOLDOWN_MS = 7_000;
-   
-     /* ── Iris & eye landmark indices ─────────────────────────────── */
-     const LM = {
-       // Left eye
-       LEFT_CORNER_INNER:  133,
-       LEFT_CORNER_OUTER:   33,
-       LEFT_EYE_TOP:       159,
-       LEFT_EYE_BOTTOM:    145,
-       LEFT_IRIS:          468,  // requires refineLandmarks: true
-   
-       // Right eye
-       RIGHT_CORNER_INNER: 362,
-       RIGHT_CORNER_OUTER: 263,
-       RIGHT_EYE_TOP:      386,
-       RIGHT_EYE_BOTTOM:   374,
-       RIGHT_IRIS:         473,  // requires refineLandmarks: true
-     };
+     const VIOLATION_COOLDOWN_MS = 8_000;
    
      /* ══════════════════════════════════════════════════════════════
-        STATE
+        2.  STATE
         ══════════════════════════════════════════════════════════════ */
    
-     /** Consecutive frames where gaze was considered "away". */
-     let _awayFrames = 0;
+     /** Rolling buffer of the last SMOOTH_WINDOW raw direction strings. */
+     const _dirBuffer = [];
    
-     /** Timestamp of the last accepted "looking away" violation. */
+     /**
+      * Wall-clock timestamp (ms) when the candidate's gaze first moved
+      * away from centre.  null when gaze is on-screen.
+      */
+     let _awayStartTime = null;
+   
+     /** Wall-clock timestamp of the last accepted violation. */
      let _lastViolationAt = 0;
    
-     /** Current gaze direction label for UI display. */
-     let _gazeLabel = "—";
+     /** The smoothed direction label shown in the UI. */
+     let _smoothedDirection = "Center";
    
-     /** Session statistics. */
+     /** Whether the candidate is currently classified as "away". */
+     let _isCurrentlyAway = false;
+   
+     /** Seconds the candidate has been away in the current streak. */
+     let _awaySeconds = 0;
+   
+     /** Session statistics exposed via getStats(). */
      const _stats = {
-       framesAnalysed: 0,
-       lookingAway:    0,
-       violations:     0,
+       framesAnalysed:     0,
+       framesAway:         0,
+       violations:         0,
+       totalAwaySeconds:   0,
+       directionCounts:    { Center: 0, Left: 0, Right: 0, Up: 0, Down: 0 },
      };
    
      /* ══════════════════════════════════════════════════════════════
-        PRIVATE — UTILITIES
+        3.  PRIVATE UTILITIES
         ══════════════════════════════════════════════════════════════ */
    
-     function _setText(id, val) {
-       const el = document.getElementById(id);
-       if (el) el.textContent = val;
-     }
+     function _el(id) { return document.getElementById(id); }
+     function _setText(id, val) { const e = _el(id); if (e) e.textContent = val; }
    
      function _setModuleState(state, label) {
        if (typeof window.setModuleState === "function") {
@@ -131,168 +179,326 @@
      }
    
      /**
-      * Safely reads a landmark's x/y from the flat array.
-      * MediaPipe normalises coordinates to [0, 1].
-      * @param {Array} landmarks
-      * @param {number} idx
-      * @returns {{ x: number, y: number }|null}
+      * Safe landmark accessor — returns { x, y } or null.
+      * MediaPipe normalises all coordinates to [0, 1].
       */
-     function _lm(landmarks, idx) {
-       const pt = landmarks[idx];
-       return pt ? { x: pt.x, y: pt.y } : null;
+     function _pt(lm, idx) {
+       const p = lm[idx];
+       return (p && typeof p.x === "number") ? { x: p.x, y: p.y } : null;
+     }
+   
+     /** Euclidean distance between two points. */
+     function _dist(a, b) {
+       return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
      }
    
      /* ══════════════════════════════════════════════════════════════
-        PRIVATE — GAZE ANALYSIS
+        4.  EYE ASPECT RATIO  (blink / closed-eye guard)
+        ══════════════════════════════════════════════════════════════
+   
+        EAR = (|p1-p5| + |p2-p4|) / (2 × |p0-p3|)
+   
+        where p0/p3 are the horizontal corners and p1/p2/p4/p5 are
+        the vertical lid points.  EAR < EAR_THRESHOLD → eye is closed.
+        We skip gaze analysis on closed eyes to avoid erratic ratios.
+        ══════════════════════════════════════════════════════════════ */
+   
+     function _ear(lm, outerIdx, innerIdx, topAIdx, topBIdx, botAIdx, botBIdx) {
+       const outer = _pt(lm, outerIdx);
+       const inner = _pt(lm, innerIdx);
+       const topA  = _pt(lm, topAIdx);
+       const topB  = _pt(lm, topBIdx);
+       const botA  = _pt(lm, botAIdx);
+       const botB  = _pt(lm, botBIdx);
+   
+       if (!outer || !inner || !topA || !topB || !botA || !botB) return 1; // assume open
+   
+       const horizontal = _dist(outer, inner);
+       if (horizontal < 0.001) return 1;
+   
+       const vertA = _dist(topA, botA);
+       const vertB = _dist(topB, botB);
+   
+       return (vertA + vertB) / (2 * horizontal);
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        5.  GAZE RATIO COMPUTATION
         ══════════════════════════════════════════════════════════════ */
    
      /**
-      * Computes horizontal gaze ratio for one eye.
-      * ratio < 0 or > 1 means landmarks are degenerate — treated as "straight".
+      * Horizontal iris ratio for one eye.
+      * 0 = iris at outer corner (looking away from nose)
+      * 1 = iris at inner corner (looking toward nose)
       *
-      * @param {Array}  landmarks
-      * @param {number} outerIdx  Outer corner landmark index.
-      * @param {number} innerIdx  Inner corner landmark index.
-      * @param {number} irisIdx   Iris centre landmark index.
-      * @returns {number}  0 = fully left, 0.5 = centre, 1 = fully right.
+      * We normalise so 0.5 always means "centre" regardless of which
+      * eye we're measuring.
       */
-     function _horizontalRatio(landmarks, outerIdx, innerIdx, irisIdx) {
-       const outer = _lm(landmarks, outerIdx);
-       const inner = _lm(landmarks, innerIdx);
-       const iris  = _lm(landmarks, irisIdx);
+     function _hRatio(lm, outerIdx, innerIdx, irisIdx) {
+       const outer = _pt(lm, outerIdx);
+       const inner = _pt(lm, innerIdx);
+       const iris  = _pt(lm, irisIdx);
        if (!outer || !inner || !iris) return 0.5;
    
-       const width = Math.abs(inner.x - outer.x);
-       if (width < 0.001) return 0.5; // degenerate / face turned too far
+       const leftX  = Math.min(outer.x, inner.x);
+       const width  = Math.abs(inner.x - outer.x);
+       if (width < 0.001) return 0.5;
    
-       const leftX = Math.min(outer.x, inner.x);
-       return (iris.x - leftX) / width;
+       const raw = (iris.x - leftX) / width;
+       // For the right eye the axis is flipped relative to the left eye;
+       // mirror it so 0 = left-looking and 1 = right-looking for both.
+       return (outerIdx === LM.R_OUTER) ? 1 - raw : raw;
      }
    
      /**
-      * Computes vertical gaze ratio for one eye.
-      * @param {Array}  landmarks
-      * @param {number} topIdx
-      * @param {number} bottomIdx
-      * @param {number} irisIdx
-      * @returns {number}  0 = fully up, 0.5 = centre, 1 = fully down.
+      * Vertical iris ratio for one eye.
+      * 0 = iris at top lid  → looking up
+      * 1 = iris at bottom lid → looking down
       */
-     function _verticalRatio(landmarks, topIdx, bottomIdx, irisIdx) {
-       const top    = _lm(landmarks, topIdx);
-       const bottom = _lm(landmarks, bottomIdx);
-       const iris   = _lm(landmarks, irisIdx);
-       if (!top || !bottom || !iris) return 0.5;
+     function _vRatio(lm, topAIdx, botAIdx, irisIdx) {
+       const top   = _pt(lm, topAIdx);
+       const bot   = _pt(lm, botAIdx);
+       const iris  = _pt(lm, irisIdx);
+       if (!top || !bot || !iris) return 0.5;
    
-       const height = Math.abs(bottom.y - top.y);
+       const height = Math.abs(bot.y - top.y);
        if (height < 0.001) return 0.5;
    
-       return (iris.y - top.y) / height;
-     }
-   
-     /**
-      * Averages the left and right eye gaze ratios and classifies direction.
-      * @param {Array} landmarks
-      * @returns {{ hRatio: number, vRatio: number, direction: string, isAway: boolean }}
-      */
-     function _classifyGaze(landmarks) {
-       const hLeft  = _horizontalRatio(landmarks, LM.LEFT_CORNER_OUTER,  LM.LEFT_CORNER_INNER,  LM.LEFT_IRIS);
-       const hRight = _horizontalRatio(landmarks, LM.RIGHT_CORNER_INNER, LM.RIGHT_CORNER_OUTER, LM.RIGHT_IRIS);
-       const hRatio = (hLeft + hRight) / 2;
-   
-       const vLeft  = _verticalRatio(landmarks, LM.LEFT_EYE_TOP,  LM.LEFT_EYE_BOTTOM,  LM.LEFT_IRIS);
-       const vRight = _verticalRatio(landmarks, LM.RIGHT_EYE_TOP, LM.RIGHT_EYE_BOTTOM, LM.RIGHT_IRIS);
-       const vRatio = (vLeft + vRight) / 2;
-   
-       let direction = "Center";
-       let isAway    = false;
-   
-       if (hRatio < GAZE.LEFT_LIMIT) {
-         direction = "Looking Left";
-         isAway    = true;
-       } else if (hRatio > GAZE.RIGHT_LIMIT) {
-         direction = "Looking Right";
-         isAway    = true;
-       } else if (vRatio < GAZE.TOP_LIMIT) {
-         direction = "Looking Up";
-         isAway    = true;
-       } else if (vRatio > GAZE.BOTTOM_LIMIT) {
-         direction = "Looking Down";
-         isAway    = true;
-       }
-   
-       return { hRatio, vRatio, direction, isAway };
+       return (iris.y - Math.min(top.y, bot.y)) / height;
      }
    
      /* ══════════════════════════════════════════════════════════════
-        PUBLIC API
+        6.  DIRECTION CLASSIFICATION
         ══════════════════════════════════════════════════════════════ */
    
      /**
-      * Called by faceDetection.js for every frame.
+      * Classifies the current frame's raw gaze into one of:
+      * "Center" | "Left" | "Right" | "Up" | "Down"
       *
-      * @param {Array|null} landmarks  468/478-point landmark array, or null
-      *                                when no face is present.
+      * Returns null when both eyes are closed (blink guard).
+      *
+      * @param {Array} lm  MediaPipe landmark array.
+      * @returns {string|null}
+      */
+     function _classifyRaw(lm) {
+       // ── Blink / closed-eye guard ──────────────────────────────────
+       const earL = _ear(lm, LM.L_OUTER, LM.L_INNER, LM.L_TOP_A, LM.L_TOP_B, LM.L_BOT_A, LM.L_BOT_B);
+       const earR = _ear(lm, LM.R_OUTER, LM.R_INNER, LM.R_TOP_A, LM.R_TOP_B, LM.R_BOT_A, LM.R_BOT_B);
+   
+       if (earL < EAR_THRESHOLD && earR < EAR_THRESHOLD) {
+         return null; // both eyes closed — skip this frame
+       }
+   
+       // ── Iris ratios ───────────────────────────────────────────────
+       const hL = _hRatio(lm, LM.L_OUTER, LM.L_INNER, LM.L_IRIS);
+       const hR = _hRatio(lm, LM.R_OUTER, LM.R_INNER, LM.R_IRIS);
+       const h  = (hL + hR) / 2;
+   
+       const vL = _vRatio(lm, LM.L_TOP_A, LM.L_BOT_A, LM.L_IRIS);
+       const vR = _vRatio(lm, LM.R_TOP_A, LM.R_BOT_A, LM.R_IRIS);
+       const v  = (vL + vR) / 2;
+   
+       // ── Classify — horizontal takes priority over vertical ────────
+       if      (h < GAZE_THRESHOLD.H_LEFT)  return "Left";
+       else if (h > GAZE_THRESHOLD.H_RIGHT) return "Right";
+       else if (v < GAZE_THRESHOLD.V_UP)    return "Up";
+       else if (v > GAZE_THRESHOLD.V_DOWN)  return "Down";
+       else                                  return "Center";
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        7.  SMOOTHING  (rolling majority vote)
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Pushes a new raw direction into the rolling buffer and returns
+      * the majority-vote smoothed direction.  Null frames (blinks) are
+      * not pushed so they don't dilute the window.
+      *
+      * @param {string|null} rawDir
+      * @returns {string}  The smoothed direction.
+      */
+     function _smooth(rawDir) {
+       if (rawDir !== null) {
+         _dirBuffer.push(rawDir);
+         if (_dirBuffer.length > SMOOTH_WINDOW) _dirBuffer.shift();
+       }
+   
+       if (_dirBuffer.length === 0) return "Center";
+   
+       // Count occurrences of each direction in the window
+       const counts = {};
+       for (const d of _dirBuffer) counts[d] = (counts[d] || 0) + 1;
+   
+       // Find the most frequent direction
+       let best = "Center", bestCount = 0;
+       for (const [dir, cnt] of Object.entries(counts)) {
+         if (cnt > bestCount) { bestCount = cnt; best = dir; }
+       }
+   
+       // Only declare if it exceeds the majority threshold
+       return (bestCount / _dirBuffer.length) >= SMOOTH_MAJORITY ? best : "Center";
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        8.  TIME-BASED AWAY TRACKING & VIOLATION
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Called on every frame with the smoothed direction.
+      * Manages wall-clock timers and fires violations when appropriate.
+      *
+      * @param {string} direction  Smoothed gaze direction.
+      */
+     function _updateAwayTimer(direction) {
+       const isAway = direction !== "Center";
+       const nowMs  = Date.now();
+   
+       if (isAway) {
+         _stats.framesAway++;
+   
+         if (_awayStartTime === null) {
+           _awayStartTime = nowMs;
+         }
+   
+         _awaySeconds = (nowMs - _awayStartTime) / 1000;
+         _stats.totalAwaySeconds += 1 / 30; // approx 30 fps contribution
+   
+         // ── Update UI with elapsed away-time ──────────────────────
+         const secsStr = _awaySeconds.toFixed(1);
+         _setText("eyeStatus", `${direction} (${secsStr}s)`);
+         _setModuleState("warn", direction);
+   
+         // ── Violation: away for ≥ 5 continuous seconds ────────────
+         if (_awaySeconds >= AWAY_VIOLATION_SECS) {
+           if (nowMs - _lastViolationAt >= VIOLATION_COOLDOWN_MS) {
+             _lastViolationAt = nowMs;
+             _stats.violations++;
+             _register("Looking away from screen", "MEDIUM");
+   
+             console.warn(
+               `%c[EyeTracking] Violation: "${direction}" for ${_awaySeconds.toFixed(1)}s.`,
+               "color:#d29922;font-family:monospace;font-weight:600"
+             );
+           }
+         }
+   
+       } else {
+         // ── Gaze returned to screen ────────────────────────────────
+         if (_awayStartTime !== null) {
+           const awayDuration = (nowMs - _awayStartTime) / 1000;
+   
+           if (awayDuration >= IGNORE_BELOW_SECS) {
+             // Glance long enough to log at debug level
+             console.debug(
+               `[EyeTracking] Gaze returned after ${awayDuration.toFixed(2)}s away.`
+             );
+           }
+           // Glances < 1 s are silently ignored (no log entry)
+         }
+   
+         _awayStartTime = null;
+         _awaySeconds   = 0;
+         _setText("eyeStatus", "Looking at screen");
+         _setModuleState("active", "On Screen");
+       }
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        9.  PUBLIC API
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * processFrame(landmarks)
+      * ────────────────────────
+      * Main entry point called by faceDetection.js on every frame.
+      *
+      * @param {Array|null} landmarks  MediaPipe 478-point landmark array,
+      *                                or null when no face is detected.
       */
      function processFrame(landmarks) {
        _stats.framesAnalysed++;
    
-       // ── No face — reset gaze state ─────────────────────────────
-       if (!landmarks || landmarks.length < 478) {
-         _awayFrames = 0;
-         _gazeLabel  = "—";
+       // ── No face ────────────────────────────────────────────────
+       if (!landmarks || landmarks.length < 468) {
+         _dirBuffer.length = 0;
+         _awayStartTime    = null;
+         _awaySeconds      = 0;
+         _smoothedDirection = "—";
          _setText("eyeStatus", "—");
          _setModuleState("warn", "No Face");
          return;
        }
    
-       // ── Classify gaze ──────────────────────────────────────────
-       const { direction, isAway } = _classifyGaze(landmarks);
-       _gazeLabel = direction;
-       _setText("eyeStatus", direction);
+       // ── Raw classification ─────────────────────────────────────
+       const rawDir = _classifyRaw(landmarks);
    
-       if (isAway) {
-         _awayFrames++;
-         _stats.lookingAway++;
-         _setModuleState("warn", direction);
+       // ── Smoothing ──────────────────────────────────────────────
+       _smoothedDirection = _smooth(rawDir);
+       _stats.directionCounts[_smoothedDirection] =
+         (_stats.directionCounts[_smoothedDirection] || 0) + 1;
    
-         // Fire violation after sustained look-away
-         if (_awayFrames >= AWAY_FRAME_THRESHOLD) {
-           const now = Date.now();
-           if (now - _lastViolationAt >= LOOK_AWAY_COOLDOWN_MS) {
-             _lastViolationAt = now;
-             _stats.violations++;
-             _register("Looking away from screen", "MEDIUM");
-             console.warn(`[EyeTracking] Violation: ${direction} (${_awayFrames} frames).`);
-           }
-         }
-       } else {
-         // Reset counter — candidate looked back
-         _awayFrames = 0;
-         _setModuleState("active", "On Screen");
+       // ── Debug log (every 30 frames ≈ every 1 s) ───────────────
+       if (_stats.framesAnalysed % 30 === 0) {
+         console.log(
+           `[EyeTracking] Gaze direction: ${_smoothedDirection}` +
+           (rawDir ? ` (raw: ${rawDir})` : " (blink)")
+         );
        }
+   
+       // ── Time tracking + violation ──────────────────────────────
+       _updateAwayTimer(_smoothedDirection);
+   
+       // ── Update left-panel "isCurrentlyAway" state ──────────────
+       _isCurrentlyAway = (_smoothedDirection !== "Center" && _smoothedDirection !== "—");
      }
    
      /**
-      * Returns current gaze label and session stats.
+      * getStats()
+      * Returns a snapshot of session data — useful for review or testing.
       */
      function getStats() {
        return {
-         currentGaze:    _gazeLabel,
-         awayFrames:     _awayFrames,
-         framesAnalysed: _stats.framesAnalysed,
-         lookingAway:    _stats.lookingAway,
-         violations:     _stats.violations,
+         smoothedDirection: _smoothedDirection,
+         isAway:            _isCurrentlyAway,
+         awaySeconds:       _awaySeconds,
+         framesAnalysed:    _stats.framesAnalysed,
+         framesAway:        _stats.framesAway,
+         violations:        _stats.violations,
+         totalAwaySeconds:  _stats.totalAwaySeconds,
+         directionCounts:   { ..._stats.directionCounts },
+         thresholds:        { ...GAZE_THRESHOLD },
+         violationAfterSecs: AWAY_VIOLATION_SECS,
        };
      }
    
-     return { processFrame, getStats, GAZE, LM };
+     return { processFrame, getStats, LM, GAZE_THRESHOLD };
    
-   })();
+   })(); // end EyeTracking IIFE
    
-   /* ── Global alias ────────────────────────────────────────────── */
-   window.EyeTracking = EyeTracking;
+   
+   /* ══════════════════════════════════════════════════════════════
+      NAMED EXPORT  (spec requirement)
+      ══════════════════════════════════════════════════════════════ */
+   
+   /**
+    * processEyeTracking(landmarks)
+    * ──────────────────────────────
+    * Spec-required named function export.
+    * Delegates to EyeTracking.processFrame().
+    *
+    * @param {Array|null} landmarks
+    */
+   function processEyeTracking(landmarks) {
+     EyeTracking.processFrame(landmarks);
+   }
+   
+   /* ── Global aliases ──────────────────────────────────────────── */
+   window.EyeTracking        = EyeTracking;
+   window.processEyeTracking = processEyeTracking;
    
    console.log(
-     "%c[EyeTracking] Module loaded — awaiting landmarks from FaceDetection.",
+     "%c[EyeTracking] Module loaded — " +
+     `violation after ${5}s away | ignore < ${1}s glances | smoothing: ${10}-frame window`,
      "color:#8b949e;font-family:monospace"
    );

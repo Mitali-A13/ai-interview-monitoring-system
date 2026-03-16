@@ -2,38 +2,55 @@
    AI Interview Monitoring System
    ai/lipMovement.js — Lip / Mouth Movement Detector
 
-   How it works
-   ────────────
-   We measure the Mouth Aspect Ratio (MAR) — the ratio of the
-   vertical mouth opening to its horizontal width.  When MAR
-   exceeds a threshold for enough consecutive frames the candidate
-   is considered to be speaking.
+   ┌─────────────────────────────────────────────────────────────┐
+   │  HOW IT WORKS                                               │
+   │                                                             │
+   │  MOUTH ASPECT RATIO (MAR)                                   │
+   │  ─────────────────────────                                  │
+   │  Using four MediaPipe landmarks:                            │
+   │    13  → upper lip centre                                   │
+   │    14  → lower lip centre                                   │
+   │    61  → left mouth corner                                  │
+   │   291  → right mouth corner                                 │
+   │                                                             │
+   │        dist(13, 14)          vertical opening               │
+   │  MAR = ─────────────────── = ─────────────────             │
+   │        dist(61, 291)         horizontal width               │
+   │                                                             │
+   │  Typical values:                                            │
+   │    < 0.05  → mouth closed / resting                        │
+   │    0.05–0.2 → speaking / slight movement                   │
+   │    > 0.2   → wide open (yawn, exclamation)                 │
+   │                                                             │
+   │  OSCILLATION DETECTION (talking vs one-time open)           │
+   │  ──────────────────────────────────────────────────         │
+   │  Sustained speaking is characterised by repeated opening    │
+   │  and closing of the mouth, not just one continuous open.   │
+   │  We track transitions between open and closed states and   │
+   │  count oscillation cycles.  A violation fires only after   │
+   │  10 continuous seconds of such oscillation.                 │
+   │                                                             │
+   │  SMOOTHING                                                  │
+   │  ─────────                                                  │
+   │  Raw MAR values are averaged over a 5-frame sliding         │
+   │  window before thresholding, preventing single noisy        │
+   │  frames from affecting state transitions.                   │
+   └─────────────────────────────────────────────────────────────┘
 
-   Landmark indices (inner lip contour)
-   ──────────────────────────────────────
-   Top centre:    13
-   Bottom centre: 14
-   Left corner:   61
-   Right corner:  291
-
-   Mouth Aspect Ratio
-   ──────────────────
-            vertical distance (13 → 14)
-   MAR  =  ──────────────────────────────
-            horizontal distance (61 → 291)
-
-   MAR thresholds (empirically determined at 640×480):
-   < 0.05  → mouth closed (normal during typing/thinking)
-   ≥ 0.05  → mouth open   (potentially speaking)
-
-   A sustained-speech violation fires only after the mouth has been
-   open for SPEAKING_FRAME_THRESHOLD consecutive frames, preventing
-   yawns, coughs, or single words from triggering an alert.
+   Spec landmark indices
+   ─────────────────────
+     Upper lip : 13
+     Lower lip : 14
+     Left corner: 61
+     Right corner: 291
 
    Integration
    ───────────
-   LipMovement.processFrame(landmarks) is called by faceDetection.js
-   on every frame.  Null landmarks = no face detected.
+   Called per-frame by ai/faceDetection.js:
+     LipMovement.processFrame(landmarks);
+
+   Also callable directly (spec-required named export):
+     processLipMovement(landmarks);
    ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
@@ -41,68 +58,104 @@
    const LipMovement = (function () {
    
      /* ══════════════════════════════════════════════════════════════
-        CONFIGURATION
+        1.  CONFIGURATION
         ══════════════════════════════════════════════════════════════ */
    
-     /**
-      * Mouth Aspect Ratio above which the mouth is considered "open".
-      * Tune this value if the environment has a different camera angle.
-      */
-     const MAR_THRESHOLD = 0.05;
-   
-     /**
-      * Number of consecutive open-mouth frames before a speaking
-      * violation is triggered.  At ~30 fps: 90 frames ≈ 3 seconds.
-      * This prevents brief sounds (cough, yawn) from firing violations.
-      */
-     const SPEAKING_FRAME_THRESHOLD = 90;
-   
-     /**
-      * After a speaking violation fires, how many milliseconds must
-      * pass before the next one can fire.
-      */
-     const SPEAKING_COOLDOWN_MS = 10_000;
-   
-     /** Landmark indices for the inner lip boundary. */
+     // ── Spec landmark indices ──────────────────────────────────────
      const LM = {
-       TOP:    13,
-       BOTTOM: 14,
-       LEFT:   61,
-       RIGHT:  291,
+       UPPER: 13,
+       LOWER: 14,
+       LEFT:  61,
+       RIGHT: 291,
      };
    
+     /**
+      * MAR above which the mouth is classified as "open".
+      * Empirically tuned for a 640×480 front-facing webcam.
+      * Increase if false positives occur in production.
+      */
+     const MAR_OPEN_THRESHOLD = 0.05;
+   
+     /**
+      * MAR below which the mouth is classified as "closed".
+      * Slightly lower than OPEN to add hysteresis and prevent
+      * rapid state flicker around the threshold boundary.
+      */
+     const MAR_CLOSE_THRESHOLD = 0.035;
+   
+     /**
+      * Sliding window size for MAR smoothing (frames).
+      * At ~30 fps: 5 frames ≈ 166 ms of smoothing.
+      */
+     const SMOOTH_WINDOW = 5;
+   
+     /**
+      * Continuous seconds of oscillating lip movement before a
+      * violation fires.  Spec requirement: 10 seconds.
+      */
+     const VIOLATION_SECS = 10;
+   
+     /**
+      * Minimum ms between two accepted "Continuous lip movement"
+      * violations.  Must be longer than ViolationManager.DEBOUNCE_MS.
+      */
+     const VIOLATION_COOLDOWN_MS = 12_000;
+   
+     /**
+      * Minimum number of open→close oscillation cycles required within
+      * VIOLATION_SECS to confirm talking (not just a sustained open mouth).
+      * At typical speech rate (~3 syllables/s) a 10 s window should
+      * contain ≥ 8 cycles even for slow speakers.
+      */
+     const MIN_OSCILLATIONS = 4;
+   
      /* ══════════════════════════════════════════════════════════════
-        STATE
+        2.  STATE
         ══════════════════════════════════════════════════════════════ */
    
-     /** Consecutive frames where MAR exceeded the threshold. */
-     let _openFrames = 0;
+     /** Rolling MAR history for smoothing. */
+     const _marBuffer = [];
    
-     /** Timestamp of the last accepted speaking violation. */
+     /** Most recent smoothed MAR value. */
+     let _smoothedMAR = 0;
+   
+     /** Current mouth state: "open" | "closed". */
+     let _mouthState = "closed";
+   
+     /**
+      * Wall-clock timestamp (ms) when continuous lip movement started.
+      * null = not currently in a lip-movement episode.
+      */
+     let _movementStartTime = null;
+   
+     /** How many open→closed transitions have occurred in the current episode. */
+     let _oscillationCount = 0;
+   
+     /** Seconds of continuous movement in the current episode. */
+     let _movementSeconds = 0;
+   
+     /** Timestamp of the last accepted violation. */
      let _lastViolationAt = 0;
    
-     /** Current status label for the UI. */
+     /** UI label for #mouthStatus. */
      let _statusLabel = "—";
-   
-     /** Most recent MAR value (for debugging / getStats). */
-     let _currentMAR = 0;
    
      /** Session statistics. */
      const _stats = {
        framesAnalysed: 0,
-       framesOpen:     0,
+       peakMAR:        0,
+       totalOpenFrames: 0,
+       oscillations:   0,
        violations:     0,
-       maxMAR:         0,
+       movementSeconds: 0,
      };
    
      /* ══════════════════════════════════════════════════════════════
-        PRIVATE — UTILITIES
+        3.  PRIVATE UTILITIES
         ══════════════════════════════════════════════════════════════ */
    
-     function _setText(id, val) {
-       const el = document.getElementById(id);
-       if (el) el.textContent = val;
-     }
+     function _el(id) { return document.getElementById(id); }
+     function _setText(id, val) { const e = _el(id); if (e) e.textContent = val; }
    
      function _setModuleState(state, label) {
        if (typeof window.setModuleState === "function") {
@@ -118,123 +171,262 @@
      }
    
      /**
-      * Euclidean distance between two normalised landmark points.
-      * @param {{ x: number, y: number }} a
-      * @param {{ x: number, y: number }} b
-      * @returns {number}
+      * Safe landmark point accessor.
+      * @param {Array} lm
+      * @param {number} idx
+      * @returns {{ x: number, y: number }|null}
       */
-     function _dist(a, b) {
-       const dx = a.x - b.x;
-       const dy = a.y - b.y;
-       return Math.sqrt(dx * dx + dy * dy);
+     function _pt(lm, idx) {
+       const p = lm[idx];
+       return (p && typeof p.x === "number") ? { x: p.x, y: p.y } : null;
      }
    
+     /** Euclidean distance between two normalised points. */
+     function _dist(a, b) {
+       return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        4.  MAR COMPUTATION
+        ══════════════════════════════════════════════════════════════ */
+   
      /**
-      * Computes the Mouth Aspect Ratio from the four key landmarks.
-      * Returns 0 if any landmark is missing or degenerate.
-      * @param {Array} landmarks
+      * Computes the raw Mouth Aspect Ratio from the four spec landmarks.
+      *
+      *       dist(upper=13, lower=14)
+      * MAR = ─────────────────────────
+      *       dist(left=61,  right=291)
+      *
+      * Returns 0 if any landmark is missing or width is degenerate.
+      *
+      * @param {Array} lm  MediaPipe landmark array.
       * @returns {number}
       */
-     function _computeMAR(landmarks) {
-       const top    = landmarks[LM.TOP];
-       const bottom = landmarks[LM.BOTTOM];
-       const left   = landmarks[LM.LEFT];
-       const right  = landmarks[LM.RIGHT];
+     function _computeMAR(lm) {
+       const upper = _pt(lm, LM.UPPER);
+       const lower = _pt(lm, LM.LOWER);
+       const left  = _pt(lm, LM.LEFT);
+       const right = _pt(lm, LM.RIGHT);
    
-       if (!top || !bottom || !left || !right) return 0;
+       if (!upper || !lower || !left || !right) return 0;
    
-       const vertical   = _dist(top, bottom);
+       const vertical   = _dist(upper, lower);
        const horizontal = _dist(left, right);
    
-       if (horizontal < 0.001) return 0; // degenerate
+       if (horizontal < 0.001) return 0;
    
        return vertical / horizontal;
      }
    
      /* ══════════════════════════════════════════════════════════════
-        PUBLIC API
+        5.  SMOOTHING  (sliding average)
         ══════════════════════════════════════════════════════════════ */
    
      /**
-      * Analyse one frame's landmarks for lip movement.
-      * Called by faceDetection.js for every processed frame.
+      * Pushes a raw MAR sample into the rolling window and returns
+      * the windowed average.
       *
-      * @param {Array|null} landmarks  MediaPipe 468/478-point array,
+      * @param {number} rawMAR
+      * @returns {number}  Smoothed MAR.
+      */
+     function _smooth(rawMAR) {
+       _marBuffer.push(rawMAR);
+       if (_marBuffer.length > SMOOTH_WINDOW) _marBuffer.shift();
+   
+       const sum = _marBuffer.reduce((a, v) => a + v, 0);
+       return sum / _marBuffer.length;
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        6.  OSCILLATION & VIOLATION LOGIC
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Updates the mouth state machine based on the current smoothed MAR.
+      * Uses hysteresis (two thresholds) to prevent rapid flicker.
+      *
+      * State transitions:
+      *   closed → open   when smoothedMAR ≥ MAR_OPEN_THRESHOLD
+      *   open   → closed when smoothedMAR <  MAR_CLOSE_THRESHOLD
+      *
+      * An oscillation (open→closed transition) increments _oscillationCount.
+      *
+      * @param {number} mar  Smoothed MAR for this frame.
+      */
+     function _updateState(mar) {
+       if (_mouthState === "closed" && mar >= MAR_OPEN_THRESHOLD) {
+         _mouthState = "open";
+         _stats.totalOpenFrames++;
+   
+       } else if (_mouthState === "open" && mar < MAR_CLOSE_THRESHOLD) {
+         _mouthState = "closed";
+         _oscillationCount++;
+         _stats.oscillations++;
+   
+       } else if (_mouthState === "open") {
+         _stats.totalOpenFrames++;
+       }
+     }
+   
+     /**
+      * Manages wall-clock tracking of lip movement episodes and fires
+      * violations when the criteria are met.
+      *
+      * An "episode" starts when the mouth first opens and ends when
+      * it has been closed for a while (episode is reset on no-face).
+      */
+     function _updateEpisodeTimer() {
+       const nowMs  = Date.now();
+       const isOpen = _mouthState === "open";
+   
+       if (isOpen || _oscillationCount > 0) {
+         // ── Start or extend the episode ───────────────────────────
+         if (_movementStartTime === null) {
+           _movementStartTime  = nowMs;
+           _oscillationCount   = 0;
+         }
+   
+         _movementSeconds = (nowMs - _movementStartTime) / 1000;
+         _stats.movementSeconds = _movementSeconds;
+   
+         // ── Violation check ────────────────────────────────────────
+         if (
+           _movementSeconds >= VIOLATION_SECS &&
+           _oscillationCount >= MIN_OSCILLATIONS &&
+           nowMs - _lastViolationAt >= VIOLATION_COOLDOWN_MS
+         ) {
+           _lastViolationAt = nowMs;
+           _stats.violations++;
+           _register("Continuous lip movement detected", "MEDIUM");
+   
+           console.warn(
+             `%c[LipMovement] Violation: ${_movementSeconds.toFixed(1)}s of lip movement, ` +
+             `${_oscillationCount} cycles (MAR=${_smoothedMAR.toFixed(3)}).`,
+             "color:#d29922;font-family:monospace;font-weight:600"
+           );
+         }
+   
+         // ── UI ─────────────────────────────────────────────────────
+         const secsStr = _movementSeconds.toFixed(1);
+         _statusLabel  = `Possible talking (${secsStr}s)`;
+         _setText("mouthStatus", _statusLabel);
+         _setModuleState("warn", "Speaking");
+   
+       } else {
+         // ── No active episode ──────────────────────────────────────
+         _movementStartTime = null;
+         _oscillationCount  = 0;
+         _movementSeconds   = 0;
+         _statusLabel       = "Normal";
+         _setText("mouthStatus", "Normal");
+         _setModuleState("active", "Silent");
+       }
+     }
+   
+     /* ══════════════════════════════════════════════════════════════
+        7.  PUBLIC API
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * processFrame(landmarks)
+      * ────────────────────────
+      * Main entry point called by faceDetection.js every frame.
+      *
+      * @param {Array|null} landmarks  MediaPipe 468/478-point landmark array,
       *                                or null when no face is detected.
       */
      function processFrame(landmarks) {
        _stats.framesAnalysed++;
    
-       // ── No face ─────────────────────────────────────────────────
-       if (!landmarks || landmarks.length < 14) {
-         _openFrames  = 0;
-         _currentMAR  = 0;
-         _statusLabel = "—";
+       // ── No face — reset episode ────────────────────────────────
+       if (!landmarks || landmarks.length < 292) {
+         _marBuffer.length  = 0;
+         _smoothedMAR       = 0;
+         _mouthState        = "closed";
+         _movementStartTime = null;
+         _oscillationCount  = 0;
+         _movementSeconds   = 0;
+         _statusLabel       = "—";
          _setText("mouthStatus", "—");
          _setModuleState("warn", "No Face");
          return;
        }
    
-       // ── Compute MAR ─────────────────────────────────────────────
-       const mar = _computeMAR(landmarks);
-       _currentMAR = mar;
-       if (mar > _stats.maxMAR) _stats.maxMAR = mar;
+       // ── Compute + smooth MAR ───────────────────────────────────
+       const rawMAR   = _computeMAR(landmarks);
+       _smoothedMAR   = _smooth(rawMAR);
    
-       const isOpen = mar >= MAR_THRESHOLD;
+       if (_smoothedMAR > _stats.peakMAR) _stats.peakMAR = _smoothedMAR;
    
-       if (isOpen) {
-         _openFrames++;
-         _stats.framesOpen++;
-         _statusLabel = "Speaking";
-         _setText("mouthStatus", "Speaking");
-         _setModuleState("warn", "Speaking");
-   
-         // ── Sustained speaking → violation ───────────────────────
-         if (_openFrames >= SPEAKING_FRAME_THRESHOLD) {
-           const now = Date.now();
-           if (now - _lastViolationAt >= SPEAKING_COOLDOWN_MS) {
-             _lastViolationAt = now;
-             _stats.violations++;
-             _register("Lip movement detected — possible communication", "MEDIUM");
-             console.warn(
-               `[LipMovement] Violation: speaking detected for ` +
-               `${_openFrames} frames (MAR=${mar.toFixed(3)}).`
-             );
-           }
-         }
-       } else {
-         // Mouth closed — reset
-         _openFrames  = 0;
-         _statusLabel = "Silent";
-         _setText("mouthStatus", "Silent");
-         _setModuleState("active", "Silent");
+       // ── Debug log every ~1 s (30 frames) ──────────────────────
+       if (_stats.framesAnalysed % 30 === 0) {
+         console.log(
+           `[LipMovement] Mouth Aspect Ratio: ${_smoothedMAR.toFixed(4)} ` +
+           `(raw: ${rawMAR.toFixed(4)}, state: ${_mouthState}, ` +
+           `oscillations: ${_oscillationCount})`
+         );
        }
+   
+       // ── State machine ──────────────────────────────────────────
+       _updateState(_smoothedMAR);
+   
+       // ── Episode timer + violation ──────────────────────────────
+       _updateEpisodeTimer();
      }
    
      /**
-      * Returns current detection state and session statistics.
+      * getStats()
+      * Returns a diagnostic snapshot of session data.
       */
      function getStats() {
        return {
-         currentMAR:     _currentMAR,
-         openFrames:     _openFrames,
-         status:         _statusLabel,
-         framesAnalysed: _stats.framesAnalysed,
-         framesOpen:     _stats.framesOpen,
-         violations:     _stats.violations,
-         maxMAR:         _stats.maxMAR,
-         marThreshold:   MAR_THRESHOLD,
+         smoothedMAR:      _smoothedMAR,
+         mouthState:       _mouthState,
+         movementSeconds:  _movementSeconds,
+         oscillationCount: _oscillationCount,
+         statusLabel:      _statusLabel,
+         framesAnalysed:   _stats.framesAnalysed,
+         totalOpenFrames:  _stats.totalOpenFrames,
+         peakMAR:          _stats.peakMAR,
+         oscillations:     _stats.oscillations,
+         violations:       _stats.violations,
+         thresholds: {
+           open:        MAR_OPEN_THRESHOLD,
+           close:       MAR_CLOSE_THRESHOLD,
+           violationAt: VIOLATION_SECS,
+           minCycles:   MIN_OSCILLATIONS,
+         },
        };
      }
    
-     return { processFrame, getStats, MAR_THRESHOLD, LM };
+     return { processFrame, getStats, LM, MAR_OPEN_THRESHOLD };
    
-   })();
+   })(); // end LipMovement IIFE
    
-   /* ── Global alias ────────────────────────────────────────────── */
-   window.LipMovement = LipMovement;
+   
+   /* ══════════════════════════════════════════════════════════════
+      NAMED EXPORT  (spec requirement)
+      ══════════════════════════════════════════════════════════════ */
+   
+   /**
+    * processLipMovement(landmarks)
+    * ──────────────────────────────
+    * Spec-required named function export.
+    * Delegates to LipMovement.processFrame().
+    *
+    * @param {Array|null} landmarks
+    */
+   function processLipMovement(landmarks) {
+     LipMovement.processFrame(landmarks);
+   }
+   
+   /* ── Global aliases ──────────────────────────────────────────── */
+   window.LipMovement        = LipMovement;
+   window.processLipMovement = processLipMovement;
    
    console.log(
-     "%c[LipMovement] Module loaded — awaiting landmarks from FaceDetection.",
+     "%c[LipMovement] Module loaded — " +
+     `violation after ${10}s of lip movement | MAR threshold: ${0.05} | ` +
+     `smoothing: ${5}-frame window`,
      "color:#8b949e;font-family:monospace"
    );
