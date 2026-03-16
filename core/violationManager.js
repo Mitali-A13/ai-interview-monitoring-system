@@ -1,10 +1,40 @@
+/* ═══════════════════════════════════════════════════════════════
+   AI Interview Monitoring System
+   core/violationManager.js — Rule Engine & Violation Registry
 
+   Responsibilities
+   ────────────────
+   1. Maintain a global violation counter and history array.
+   2. Map violation counts to warning levels (Normal → Terminated).
+   3. Debounce identical violation reasons (default 3 s cooldown).
+   4. Update all UI elements: counter, warning bar, log, alert badge.
+   5. Terminate the interview when the violation threshold is reached.
+   6. Expose registerViolation(reason, severity?) as the single entry
+      point for every monitoring module (tab, clipboard, face, eye, lip).
+
+   Integration
+   ───────────
+   This file is loaded before script.js in index.html:
+     <script src="core/violationManager.js"></script>
+     <script src="script.js"></script>
+
+   Other modules call:
+     ViolationManager.registerViolation("Tab switch detected");
+     ViolationManager.registerViolation("Multiple faces detected", "HIGH");
+
+   Or via the window alias:
+     window.registerViolation("Looking away from screen");
+   ═══════════════════════════════════════════════════════════════ */
 
    "use strict";
 
    const ViolationManager = (function () {
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        CONSTANTS
+        ══════════════════════════════════════════════════════════════ */
+   
+     /** Milliseconds a reason is blocked from re-firing after it triggers. */
      const DEBOUNCE_MS = 3000;
    
      /** Violation count thresholds that define each level. */
@@ -15,43 +45,83 @@
        TERMINATED: 5,   // 5+      → Terminated
      };
    
-     
+     /**
+      * Severity definitions used when building log entries.
+      * Consumers can pass a string key ("LOW" / "MEDIUM" / "HIGH")
+      * or reference ViolationManager.SEVERITY directly.
+      */
      const SEVERITY = {
        LOW:    { key: "low",    label: "WARN",   cssClass: "level-low"    },
        MEDIUM: { key: "medium", label: "MEDIUM", cssClass: "level-medium" },
        HIGH:   { key: "high",   label: "HIGH",   cssClass: "level-high"   },
      };
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        STATE
+        ══════════════════════════════════════════════════════════════ */
    
      /** Running total of accepted violations. */
      let _count = 0;
    
-     
+     /**
+      * Full history of every accepted violation.
+      * Each entry: { id, reason, severity, timestamp, ts }
+      *   id        — sequential integer (1-based)
+      *   reason    — human-readable description
+      *   severity  — one of the SEVERITY objects
+      *   timestamp — Date object at time of registration
+      *   ts        — "HH:MM:SS" string for display
+      */
      const _history = [];
    
-     
+     /**
+      * Debounce registry.
+      * Maps normalised reason string → timestamp (ms) of last acceptance.
+      * A reason is suppressed if now - lastAccepted < DEBOUNCE_MS.
+      */
      const _lastAccepted = new Map();
    
      /** Whether the interview has already been terminated. */
      let _terminated = false;
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — UTILITIES
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Left-pads a number to 2 digits.
+      * @param {number} n
+      * @returns {string}
+      */
      function _pad(n) {
        return String(n).padStart(2, "0");
      }
    
-     
+     /**
+      * Returns a "HH:MM:SS" string for the given Date (defaults to now).
+      * @param {Date} [date]
+      * @returns {string}
+      */
      function _timestamp(date = new Date()) {
        return `${_pad(date.getHours())}:${_pad(date.getMinutes())}:${_pad(date.getSeconds())}`;
      }
    
-     
+     /**
+      * Normalises a reason string for use as a debounce map key.
+      * Lowercasing + trimming prevents "Tab switch" vs "tab switch" bypasses.
+      * @param {string} reason
+      * @returns {string}
+      */
      function _normalise(reason) {
        return reason.trim().toLowerCase();
      }
    
-     
+     /**
+      * Resolves a severity argument (string key or object) to a SEVERITY entry.
+      * Falls back to SEVERITY.LOW for unknown inputs.
+      * @param {string|object} input
+      * @returns {{ key: string, label: string, cssClass: string }}
+      */
      function _resolveSeverity(input) {
        if (!input) return SEVERITY.LOW;
        if (typeof input === "object" && input.key) return input;
@@ -62,7 +132,12 @@
        return SEVERITY.LOW;
      }
    
-     
+     /**
+      * Escapes HTML special characters so injected reason text
+      * cannot introduce markup into the log.
+      * @param {string} s
+      * @returns {string}
+      */
      function _escHtml(s) {
        return String(s)
          .replace(/&/g, "&amp;")
@@ -71,18 +146,36 @@
          .replace(/"/g, "&quot;");
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — DEBOUNCE
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Returns true if the reason is within its cooldown window.
+      * @param {string} key  Normalised reason string.
+      * @returns {boolean}
+      */
      function _isDebounced(key) {
        if (!_lastAccepted.has(key)) return false;
        return (Date.now() - _lastAccepted.get(key)) < DEBOUNCE_MS;
      }
    
-     
+     /**
+      * Records the current timestamp for a reason key.
+      * @param {string} key
+      */
      function _recordAcceptance(key) {
        _lastAccepted.set(key, Date.now());
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — WARNING LEVEL
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Derives the current warning level descriptor from _count.
+      * @returns {{ label: string, barWidth: string, valueClass: string, badgeClass: string }}
+      */
      function _getLevel() {
        if (_count >= THRESHOLDS.TERMINATED) {
          return { label: "TERMINATED", barWidth: "100%", valueClass: "warn-high", badgeClass: "badge badge-alert" };
@@ -96,7 +189,16 @@
        return   { label: "NORMAL",     barWidth: "8%",   valueClass: "",          badgeClass: "badge badge-clear" };
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — UI UPDATES
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Fetches a DOM element by ID, returning null without throwing
+      * if the element does not exist yet.
+      * @param {string} id
+      * @returns {HTMLElement|null}
+      */
      function _el(id) {
        return document.getElementById(id);
      }
@@ -132,7 +234,10 @@
        }
      }
    
-     
+     /**
+      * Appends a new <li> entry to the violation log console.
+      * @param {object} entry  Violation history entry.
+      */
      function _appendLogEntry(entry) {
        const logEl = _el("violationLog");
        if (!logEl) return;
@@ -164,7 +269,14 @@
        if (lastEl) lastEl.textContent = `Last event: ${ts}`;
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — TERMINATION
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * Locks the system and alerts the proctor when violations reach
+      * the TERMINATED threshold.
+      */
      function _terminateInterview() {
        _terminated = true;
    
@@ -194,7 +306,10 @@
        }, 300);
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PRIVATE — CONSOLE LOGGING
+        ══════════════════════════════════════════════════════════════ */
+   
      const _consolePalette = {
        low:    "#d29922",
        medium: "#d29922",
@@ -213,7 +328,37 @@
        );
      }
    
-     
+     /* ══════════════════════════════════════════════════════════════
+        PUBLIC API
+        ══════════════════════════════════════════════════════════════ */
+   
+     /**
+      * registerViolation(reason, severity?)
+      * ──────────────────────────────────────
+      * The single entry point for all monitoring modules.
+      *
+      * Steps performed on each accepted call:
+      *   1. Guard: ignore if interview is already terminated.
+      *   2. Debounce: suppress if the same reason fired < DEBOUNCE_MS ago.
+      *   3. Increment counter & build history entry.
+      *   4. Update all UI elements (counter, bar, log, badge).
+      *   5. Check threshold and terminate if needed.
+      *
+      * @param {string}         reason    Human-readable description of the event.
+      * @param {string|object}  [severity="LOW"]  "LOW" | "MEDIUM" | "HIGH" or a
+      *                                           SEVERITY object.  Defaults to LOW.
+      * @returns {object|null}  The recorded history entry, or null if suppressed.
+      *
+      * @example
+      *   // From monitoring/tabMonitor.js
+      *   ViolationManager.registerViolation("Tab switch detected", "MEDIUM");
+      *
+      *   // From ai/faceDetection.js
+      *   ViolationManager.registerViolation("Multiple faces detected", "HIGH");
+      *
+      *   // Via the global alias
+      *   window.registerViolation("Looking away from screen", "LOW");
+      */
      function registerViolation(reason, severity = "LOW") {
        // ── Guard: already terminated ────────────────────────────────
        if (_terminated) {
@@ -301,7 +446,18 @@
        return _getLevel().label;
      }
    
-     
+     /**
+      * Returns true if the interview has been terminated.
+      * @returns {boolean}
+      */
+     function isTerminated() {
+       return _terminated;
+     }
+   
+     /**
+      * Resets all state — intended for unit tests or a "restart session".
+      * Does NOT reload the page; just clears counters and re-renders UI.
+      */
      function reset() {
        _count      = 0;
        _terminated = false;
@@ -321,7 +477,9 @@
        console.log("[ViolationManager] State reset.");
      }
    
-    
+     /* ══════════════════════════════════════════════════════════════
+        RETURN — public surface
+        ══════════════════════════════════════════════════════════════ */
      return {
        registerViolation,
        getHistory,
@@ -337,6 +495,30 @@
    })(); // end IIFE
    
    
+   /* ══════════════════════════════════════════════════════════════
+      GLOBAL ALIASES
+      ══════════════════════════════════════════════════════════════
+   
+      Modules that don't have a direct reference to ViolationManager
+      can call these window-level helpers instead.
+   
+      Examples
+      ────────
+      // monitoring/tabMonitor.js
+      window.registerViolation("Tab switch detected", "MEDIUM");
+   
+      // ai/faceDetection.js
+      window.registerViolation("Multiple faces detected", "HIGH");
+   
+      // ai/eyeTracking.js
+      window.registerViolation("Looking away from screen", "LOW");
+   
+      // ai/lipMovement.js
+      window.registerViolation("Continuous lip movement detected", "LOW");
+   
+      // monitoring/clipboardMonitor.js
+      window.registerViolation("Clipboard usage attempt", "MEDIUM");
+      ══════════════════════════════════════════════════════════════ */
    
    window.ViolationManager    = ViolationManager;
    window.registerViolation   = ViolationManager.registerViolation;
